@@ -4,6 +4,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -57,6 +58,7 @@ struct Channel {
     name: String,
     kind: ChannelKind,
     members: Vec<UserId>,
+    active_users: Vec<UserId>,
     
 }
 /*
@@ -107,10 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     /*
         main runs a loop awaiting new listeners and for each opens up an async task to handle each user
-        this is far more performant
+        this is far more performant than threaded.
     
      */
     loop {
+
         let (socket, address) = listener.accept().await?;
 
         println!("client connected from {}", address);
@@ -139,10 +142,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState>>) -> Result<(), Box<dyn std::error::Error>>{
+
     let (reader, mut writer) = stream.into_split();
 
 
-    // this will later be redeclared to the user ID after login
+    // this will later be redeclared to the user ID after login. Maybe I will eventually find a cleaner way of getting this global to handle_client
     let mut client_id: Option<u64> = None;
 
     let mut reader = BufReader::new(reader);
@@ -179,7 +183,7 @@ async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState
             state.connections.insert(
                 id,
                 ClientConnection { user_id: Some(id), writer }
-            ); // GOT UP TO HERE
+            ); 
             /*
                 log - im thinking about how i access the username and shit
                 globally - do I maybe have to declare them
@@ -196,10 +200,11 @@ async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState
             let mut state = serverState.lock().await;
 
             let username = state.users.get(&user_id).unwrap().username.clone();
-            
+
             if let Some(conn) = state.connections.get_mut(&client_id){
             
                 conn.writer.write_all(format!("Welcome, {username}, you successfully logged in!\n").as_bytes()).await?;
+
             }
         }
         
@@ -228,6 +233,90 @@ async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState
         println!("{}", message);
         
     }
+    // main message loop end
+
+
     Ok(())
+}
+
+/* =========================================
+*
+* ====== BELOW LIES HELPER FUNCTIONS =======
+*
+* ==========================================
+*/ 
+
+async fn login_phase(mut reader: BufReader<OwnedReadHalf>,writer: OwnedWriteHalf, state_clone:  &Arc<Mutex<ServerState>>) -> Result<LoginResult, Box<dyn std::error::Error>>{
+    
+    let mut line = String::new();
+
+    
+
+    // first command - expect a LOGIN this will probably end up being wrapped to a function for readability
+
+    line.clear();
+    let n = reader.read_line(&mut line).await?;
+    if n == 0 {
+        return Ok((LoginResult::disconnected))
+        // client disconnects immediately
+    }
+
+    let line = line.trim_end(); // removes \n
+    if let Some(rest) = line.strip_prefix("LOGIN ") {
+
+        let username = rest.to_string();
+
+        let user_id = {
+            let mut state = state_clone.lock().await;
+            let id = state.next_user_id;
+            state.next_user_id += 1;
+
+
+            // creates new user & add to server state connections
+            let user = User {id, username: username.clone()};
+
+            /* ok so the issue is this - writer is passed to server state within this block causing ownership issues at the else clause
+            * the solution to this, is to do the below insertions after the welcome message is printed
+            * (it also makes sense to add to state once the login is actually finished) but im gonna take a break for sanity.
+            * also pondering perhaps we could do all the user_id block at the end as it doesnt really matter if users have an ID in the order they join
+            * plus it may make this shitshow more readable.
+            */
+
+            state.users.insert(id, user);
+
+            state.connections.insert(
+                id,
+                ClientConnection { user_id: Some(id), writer }
+            ); 
+            id
+        };
+
+
+        
+
+        {
+            let mut state = state_clone.lock().await;
+
+            let username = state.users.get(&user_id).unwrap().username.clone();
+
+            if let Some(conn) = state.connections.get_mut(&user_id){
+            
+                conn.writer.write_all(format!("Welcome, {username}, you successfully logged in!\n").as_bytes()).await?;
+
+            }
+        }
+        return Ok(LoginResult::Success(user_id, reader));
+        
+    } else {
+        writer.write_all("expected: LOGIN - dropping connection. Please try again!".as_bytes()).await?;
+        return Ok((LoginResult::disconnected));
+    }
+
+
+}
+
+enum LoginResult{
+    Success(UserId, BufReader<OwnedReadHalf>),
+    disconnected,
 }
 

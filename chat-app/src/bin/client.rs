@@ -10,18 +10,12 @@ use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 
 /*
-    the client (in this iteration) connects to the server and sends / reads messages to it to be relayed to the other client
+    the client (in this iteration) connects to the server and sends / reads messages. I think a CLI command based client is fine until front end.
 
 
 */
 
 #[tokio::main]
-/*
-    BEFORE CONTINUING HERE, LEARN ABOUT RUNNING CONCURRENTLY 
-    do a deep dive on tokio and async runtime
-
-
-*/
 
 
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -64,6 +58,8 @@ async fn listen_for_messages(mut stream: OwnedReadHalf) -> Result<(), Box<dyn Er
 
     Ok(())
 }   
+
+
 // loop to keep prompting to write a message
 async fn write_messages(mut stream: OwnedWriteHalf) -> Result<(), Box<dyn Error>> {
         // stdin is the reusable buffer each typed message is stored
