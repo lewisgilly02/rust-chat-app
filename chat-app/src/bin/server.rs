@@ -270,17 +270,22 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,writer: OwnedWriteHalf
             let mut state = state_clone.lock().await;
             let id = state.next_user_id;
             state.next_user_id += 1;
-
-
-            // creates new user & add to server state connections
-            let user = User {id, username: username.clone()};
-
+            // so after the above line the user's id is locked in here and it can't be affected by anything else until incremented because arc mutex so its fine now
+            // it is impossible to end up with mix ups.
+            
             /* ok so the issue is this - writer is passed to server state within this block causing ownership issues at the else clause
             * the solution to this, is to do the below insertions after the welcome message is printed
             * (it also makes sense to add to state once the login is actually finished) but im gonna take a break for sanity.
             * also pondering perhaps we could do all the user_id block at the end as it doesnt really matter if users have an ID in the order they join
-            * plus it may make this shitshow more readable.
+            * plus it may make this shitshow more readable
+            *
+            * Extra thought on 26/11/25, yeah its completely redundant -
+            * realistically everything after state.nextuserid doesnt actually need to be done here - The user id is sorted anyways so yeah we can just do all the shit after at the end
+            * an issue i can see arising is now the state insertions cant use id, but rather will have to use user_id
             */
+
+            // creates new user & add to server state connections
+            let user = User {id, username: username.clone()};
 
             state.users.insert(id, user);
 
