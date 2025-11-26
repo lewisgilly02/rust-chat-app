@@ -87,10 +87,18 @@ struct ServerState {
 }
 
 
+/*
+* Ok had to use chat gpt to explain this to me
+* previously I was using Box< dyn std::error::Error> as the result of async functions
+* but the issue was tokio::spawn requires whatever is in it is safe to move
+* to another OS thread but box dyn error isn't marked as thread safe so will just define it here
+* and use anyerror and hope it doesn't cause issues down the line
+*/
+type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 
 #[tokio::main]  
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), AnyError> {
     const PORT: &str = "127.0.0.1:7878";
 
 
@@ -141,100 +149,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 
-async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState>>) -> Result<(), Box<dyn std::error::Error>>{
+async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState>>) -> Result<(), AnyError>{
 
     let (reader, mut writer) = stream.into_split();
 
-
-    // this will later be redeclared to the user ID after login. Maybe I will eventually find a cleaner way of getting this global to handle_client
-    let mut client_id: Option<u64> = None;
-
     let mut reader = BufReader::new(reader);
+
+    let state_clone = &serverState.clone();
     
-    let mut line = String::new();
-
-    // first command - expect a LOGIN this will probably end up being wrapped to a function for readability
-
-    line.clear();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        return Ok(())
-        // client disconnects immediately
-    }
-
-    let line = line.trim_end(); // removes \n
-    if let Some(rest) = line.strip_prefix("LOGIN ") {
-
-        let username = rest.to_string();
-
-        let user_id = {
-            let mut state = serverState.lock().await;
-            let id = state.next_user_id;
-            state.next_user_id += 1;
-
-
-            // creates new user & add to server state connections
-            let user = User {id, username: username.clone()};
-
-
-
-            state.users.insert(id, user);
-
-            state.connections.insert(
-                id,
-                ClientConnection { user_id: Some(id), writer }
-            ); 
-            /*
-                log - im thinking about how i access the username and shit
-                globally - do I maybe have to declare them
-                and re-designate them at the start of handle client maybe?
-             */
-            id
-        };
-
-        client_id = Some(user_id);
-        let client_id = client_id.unwrap();
-        
-
-        {
-            let mut state = serverState.lock().await;
-
-            let username = state.users.get(&user_id).unwrap().username.clone();
-
-            if let Some(conn) = state.connections.get_mut(&client_id){
-            
-                conn.writer.write_all(format!("Welcome, {username}, you successfully logged in!\n").as_bytes()).await?;
-
-            }
+    match login_phase(reader, writer, state_clone).await?{
+        LoginResult::Success(user_id , reader) => {
+            main_message_loop(user_id, reader).await?;
         }
-        
-    } else {
-        writer.write_all("expected: LOGIN - dropping connection. Please try again!".as_bytes()).await?;
-        return Ok(());
-    }
-    
-
-    // main message loop
-
-    let mut line = String::new();
-    loop {
-
-        line.clear();
-        
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            println!("client disconnected");
-            break;
+        LoginResult::disconnected => {
+            return Ok(())
         }
-
-        let message = line.trim_end();
-        
-
-        println!("{}", message);
-        
     }
-    // main message loop end
-
 
     Ok(())
 }
@@ -246,8 +176,8 @@ async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState
 * ==========================================
 */ 
 
-async fn login_phase(mut reader: BufReader<OwnedReadHalf>,writer: OwnedWriteHalf, state_clone:  &Arc<Mutex<ServerState>>) -> Result<LoginResult, Box<dyn std::error::Error>>{
-    
+async fn login_phase(mut reader: BufReader<OwnedReadHalf>,mut writer: OwnedWriteHalf, state_clone:  &Arc<Mutex<ServerState>>) -> Result<LoginResult, AnyError>{
+    println!("a client has entered the login phase");
     let mut line = String::new();
 
     
@@ -283,16 +213,6 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,writer: OwnedWriteHalf
             * realistically everything after state.nextuserid doesnt actually need to be done here - The user id is sorted anyways so yeah we can just do all the shit after at the end
             * an issue i can see arising is now the state insertions cant use id, but rather will have to use user_id
             */
-
-            // creates new user & add to server state connections
-            let user = User {id, username: username.clone()};
-
-            state.users.insert(id, user);
-
-            state.connections.insert(
-                id,
-                ClientConnection { user_id: Some(id), writer }
-            ); 
             id
         };
 
@@ -302,8 +222,19 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,writer: OwnedWriteHalf
         {
             let mut state = state_clone.lock().await;
 
+            // creates new user & add to server state connections
+            let user = User {id: user_id, username: username.clone()};
+            
+            state.users.insert(user_id, user);
+            
+            state.connections.insert(
+                user_id,
+                ClientConnection { user_id: Some(user_id), writer }
+            ); 
+            
+            // this caused a crash as it unwrapped a none value as we insert the client details to state below here.
             let username = state.users.get(&user_id).unwrap().username.clone();
-
+            
             if let Some(conn) = state.connections.get_mut(&user_id){
             
                 conn.writer.write_all(format!("Welcome, {username}, you successfully logged in!\n").as_bytes()).await?;
@@ -319,9 +250,30 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,writer: OwnedWriteHalf
 
 
 }
-
 enum LoginResult{
     Success(UserId, BufReader<OwnedReadHalf>),
     disconnected,
+}
+
+
+async fn main_message_loop(user_id: UserId, mut reader: BufReader<OwnedReadHalf>) -> Result<(), AnyError>{
+    let mut line = String::new();
+    loop {
+
+        line.clear();
+        
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            println!("client disconnected");
+            break;
+        }
+
+        let message = line.trim_end();
+        
+
+        println!("{}", message);
+        
+    }
+    Ok(())
 }
 

@@ -67,17 +67,17 @@ async fn write_messages(mut stream: OwnedWriteHalf) -> Result<(), Box<dyn Error>
         let mut buffer = String::new();
 
 
-        println!("enter your message: ");
+        
+        loop {
+            println!("enter your message: ");
+            buffer.clear();
+            let bytes_read = stdin.read_line(&mut buffer).await?;
 
-    loop {
-        buffer.clear();
-        let bytes_read = stdin.read_line(&mut buffer).await?;
-
-        // sending an empty message is the exit in place of a button or whatever
-        if bytes_read == 0 {
-            break;
-        }
-        stream.write_all(buffer.as_bytes()).await?;
+            // sending an empty message is the exit in place of a button or whatever
+            if bytes_read == 0 {
+                break;
+            }
+            stream.write_all(buffer.as_bytes()).await?;
     }
     Ok(())
 }
