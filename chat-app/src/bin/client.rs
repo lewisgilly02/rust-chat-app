@@ -1,10 +1,8 @@
 
 
 use std::error::Error;
-use std::ptr::read;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
@@ -20,9 +18,9 @@ use tokio::net::tcp::OwnedWriteHalf;
 
 async fn main() -> Result<(), Box<dyn Error>> {
     const PORT: &str = "127.0.0.1:7878";
-    let mut stream = TcpStream::connect(PORT).await?;
+    let stream = TcpStream::connect(PORT).await?;
     // de structure the tuple returned by into split to seperate the two stream halves
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
 
     tokio::select! {
         _ = listen_for_messages(reader) => {

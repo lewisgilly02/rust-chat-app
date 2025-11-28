@@ -3,14 +3,11 @@
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::mem;
 use tokio::io::BufReader;
-use std::ptr::read;
 use std::time::SystemTime;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -112,6 +109,8 @@ async fn main() -> Result<(), AnyError> {
     };
     // wrap so tasks may share a server state
     let shared_state = Arc::new(Mutex::new(state));
+    // inserting channels for testing
+    create_test_channels_and_add_to_state(shared_state.clone()).await;
 
     let listener = TcpListener::bind(PORT).await?;
 
@@ -138,6 +137,30 @@ async fn main() -> Result<(), AnyError> {
     Ok(())
 }
 
+async fn create_test_channels_and_add_to_state(state: Arc<Mutex<ServerState>>){
+   let channel_1 = Channel{
+       id: 1,
+       name: String::from("First Channel!"),
+       kind: ChannelKind::Broadcast,
+       members: Vec::new(),
+       active_users: Vec::new()
+   };
+
+
+    let channel_2 = Channel{
+       id: 2,
+       name: String::from("Second Channel!"),
+       kind: ChannelKind::Broadcast,
+       members: Vec::new(),
+       active_users: Vec::new()
+   };
+
+   {
+    let mut state = state.lock().await;
+    state.channels.insert(channel_1.id, channel_1);
+    state.channels.insert(channel_2.id, channel_2);
+   }
+}
 
 
 
@@ -147,21 +170,19 @@ async fn main() -> Result<(), AnyError> {
 
 
 
+async fn handle_client(stream: TcpStream, server_state: Arc<Mutex<ServerState>>) -> Result<(), AnyError>{
 
+    let (reader, writer) = stream.into_split();
 
-async fn handle_client(mut stream: TcpStream, serverState: Arc<Mutex<ServerState>>) -> Result<(), AnyError>{
+    let reader = BufReader::new(reader);
 
-    let (reader, mut writer) = stream.into_split();
-
-    let mut reader = BufReader::new(reader);
-
-    let state_clone = &serverState.clone();
+    let state_clone = &server_state.clone();
     
     match login_phase(reader, writer, state_clone).await?{
         LoginResult::Success(user_id , reader) => {
-            main_message_loop(user_id, reader).await?;
+            session_loop(user_id, reader, state_clone).await?;
         }
-        LoginResult::disconnected => {
+        LoginResult::Disconnected => {
             return Ok(())
         }
     }
@@ -187,7 +208,7 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,mut writer: OwnedWrite
     line.clear();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
-        return Ok((LoginResult::disconnected))
+        return Ok(LoginResult::Disconnected)
         // client disconnects immediately
     }
 
@@ -197,32 +218,24 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,mut writer: OwnedWrite
         let username = rest.to_string();
 
         let user_id = {
+
             let mut state = state_clone.lock().await;
+
             let id = state.next_user_id;
+
             state.next_user_id += 1;
-            // so after the above line the user's id is locked in here and it can't be affected by anything else until incremented because arc mutex so its fine now
-            // it is impossible to end up with mix ups.
-            
-            /* ok so the issue is this - writer is passed to server state within this block causing ownership issues at the else clause
-            * the solution to this, is to do the below insertions after the welcome message is printed
-            * (it also makes sense to add to state once the login is actually finished) but im gonna take a break for sanity.
-            * also pondering perhaps we could do all the user_id block at the end as it doesnt really matter if users have an ID in the order they join
-            * plus it may make this shitshow more readable
-            *
-            * Extra thought on 26/11/25, yeah its completely redundant -
-            * realistically everything after state.nextuserid doesnt actually need to be done here - The user id is sorted anyways so yeah we can just do all the shit after at the end
-            * an issue i can see arising is now the state insertions cant use id, but rather will have to use user_id
-            */
+
             id
         };
 
+    
+        let available_channels = get_available_channels(state_clone).await.unwrap();
 
-        
 
         {
             let mut state = state_clone.lock().await;
 
-            // creates new user & add to server state connections
+            
             let user = User {id: user_id, username: username.clone()};
             
             state.users.insert(user_id, user);
@@ -231,13 +244,14 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,mut writer: OwnedWrite
                 user_id,
                 ClientConnection { user_id: Some(user_id), writer }
             ); 
-            
-            // this caused a crash as it unwrapped a none value as we insert the client details to state below here.
+
             let username = state.users.get(&user_id).unwrap().username.clone();
             
             if let Some(conn) = state.connections.get_mut(&user_id){
-            
+
+                
                 conn.writer.write_all(format!("Welcome, {username}, you successfully logged in!\n").as_bytes()).await?;
+                conn.writer.write_all(format!("Available channels: {available_channels}").as_bytes()).await?;
 
             }
         }
@@ -245,35 +259,107 @@ async fn login_phase(mut reader: BufReader<OwnedReadHalf>,mut writer: OwnedWrite
         
     } else {
         writer.write_all("expected: LOGIN - dropping connection. Please try again!".as_bytes()).await?;
-        return Ok((LoginResult::disconnected));
+        return Ok(LoginResult::Disconnected);
     }
 
 
 }
 enum LoginResult{
     Success(UserId, BufReader<OwnedReadHalf>),
-    disconnected,
+    Disconnected,
 }
 
 
-async fn main_message_loop(user_id: UserId, mut reader: BufReader<OwnedReadHalf>) -> Result<(), AnyError>{
+// this cannot be called within a block where the ARC MUTEX is locked
+// it is best to do so; slow work like this should be 
+async fn get_available_channels(state: &Arc<Mutex<ServerState>>) -> Result<String, AnyError>{
+    
+    
+    let names = {
+        let state = state.lock().await;
+        state.channels.values().map(|c| c.name.clone()).collect::<Vec<_>>()
+    };
+
+    let mut output = String::new();
+
+    for name in names {
+        output.push('\n');
+        output.push_str(&name);
+        output.push('\n');
+    }
+
+        
+    
+    Ok((output))
+}
+
+
+async fn session_loop(user_id: UserId, mut reader: BufReader<OwnedReadHalf>, state: &Arc<Mutex<ServerState>>) -> Result<(), AnyError>{
+    println!("a client has reached the session loop");
     let mut line = String::new();
     loop {
-
+        let state_clone = state.clone();
         line.clear();
-        
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
             println!("client disconnected");
             break;
         }
 
-        let message = line.trim_end();
+        let command = parse_command(line.as_str());
         
 
-        println!("{}", message);
+        match command{
+            Command::Join(name) =>
+            {
+                join_channel(name, state_clone);
+            },
+            Command::Active(name) =>
+            {
+
+            },
+            Command::Inactive => todo!(),
+            Command::Message(message) => todo!(),
+            Command::Quit => todo!(),
+            Command::Unknown => todo!(),
+        }
         
     }
     Ok(())
 }
 
+enum Command {
+    Join(String),
+    Active(String),
+    Inactive,
+    Message(String),
+    Quit,
+    Unknown,
+}
+
+fn parse_command(line: &str) -> Command {
+    if let Some(name) = line.strip_prefix("JOIN ")
+    {
+        Command::Join(name.to_string())
+    }
+    else if let Some(message) = line.strip_prefix("MESSAGE ")
+    {
+        Command::Message(message.to_string())
+    }
+    else if let Some(name) = line.strip_prefix("ACTIVE ")
+    {
+        Command::Active(name.to_string())
+    }
+    else if line == "QUIT" 
+    {
+        Command::Quit
+    }
+    else 
+    {
+        Command::Unknown
+    }
+}
+
+async fn join_channel(channel_name: String, state: Arc<Mutex<ServerState>>){
+
+}
