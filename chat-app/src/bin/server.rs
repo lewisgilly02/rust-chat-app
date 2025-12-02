@@ -55,7 +55,7 @@ struct Channel {
     name: String,
     kind: ChannelKind,
     members: Vec<UserId>,
-    active_users: Vec<UserId>,
+    active_users: Vec<UserId>, // prob wont be used until post front end intergration
     
 }
 /*
@@ -140,7 +140,7 @@ async fn main() -> Result<(), AnyError> {
 async fn create_test_channels_and_add_to_state(state: Arc<Mutex<ServerState>>){
    let channel_1 = Channel{
        id: 1,
-       name: String::from("First Channel!"),
+       name: String::from("First"),
        kind: ChannelKind::Broadcast,
        members: Vec::new(),
        active_users: Vec::new()
@@ -149,7 +149,7 @@ async fn create_test_channels_and_add_to_state(state: Arc<Mutex<ServerState>>){
 
     let channel_2 = Channel{
        id: 2,
-       name: String::from("Second Channel!"),
+       name: String::from("Second_Channel!"),
        kind: ChannelKind::Broadcast,
        members: Vec::new(),
        active_users: Vec::new()
@@ -161,10 +161,6 @@ async fn create_test_channels_and_add_to_state(state: Arc<Mutex<ServerState>>){
     state.channels.insert(channel_2.id, channel_2);
    }
 }
-
-
-
-
 
 
 
@@ -290,7 +286,7 @@ async fn get_available_channels(state: &Arc<Mutex<ServerState>>) -> Result<Strin
 
         
     
-    Ok((output))
+    Ok(output)
 }
 
 
@@ -298,7 +294,9 @@ async fn session_loop(user_id: UserId, mut reader: BufReader<OwnedReadHalf>, sta
     println!("a client has reached the session loop");
     let mut line = String::new();
     loop {
+        // pretty much each command uses the state mutex so we will just clone per request - cheap enough unless I figure out a better way.
         let state_clone = state.clone();
+
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
@@ -312,7 +310,7 @@ async fn session_loop(user_id: UserId, mut reader: BufReader<OwnedReadHalf>, sta
         match command{
             Command::Join(name) =>
             {
-                join_channel(name, state_clone);
+                join_channel(name, user_id, state_clone).await?;
             },
             Command::Active(name) =>
             {
@@ -321,7 +319,7 @@ async fn session_loop(user_id: UserId, mut reader: BufReader<OwnedReadHalf>, sta
             Command::Inactive => todo!(),
             Command::Message(message) => todo!(),
             Command::Quit => todo!(),
-            Command::Unknown => todo!(),
+            Command::Unknown => send_message_to_client(&state_clone, user_id, "unknown command".to_string()).await?,
         }
         
     }
@@ -360,6 +358,78 @@ fn parse_command(line: &str) -> Command {
     }
 }
 
-async fn join_channel(channel_name: String, state: Arc<Mutex<ServerState>>){
+async fn join_channel(channel_name: String, user_id: UserId, state: Arc<Mutex<ServerState>>) -> Result<(), AnyError>{
 
+    println!("join channel function activated for {}", &channel_name);
+    // the function triggered when a client wants to join a channel
+    // of course we have yet to introduce permissions etc, so client will be able to just say any channel name that exists.
+    // needed from state = state.servers to modify
+    // flow - match the paramater channel_name to the channel
+
+    // go over each channel in state.channels and see which channelid matches the channel_name
+    // save the channel id
+    //  go back into state and append user id to the members of state.channels,get_mut(channel_id)
+    let state_clone_for_match = state.clone();
+
+    let state_clone_for_send_message = state.clone();
+
+    match match_channel_name_to_id(channel_name, &state_clone_for_match).await {
+        // this some wont trigger indicating the name is getting manipulated incorrectly perhaps or that this function doesn't work in the intended way
+        Some(channel_id) => {
+            let mut channel_name = String::new();
+            {
+                
+                let mut state = state.lock().await;
+    
+                //unwrap is fine here as we verify the channel to exist in match name to id
+                let channel_to_join = state.channels.get_mut(&channel_id).unwrap();
+                
+                channel_name = channel_to_join.name.clone();
+
+                channel_to_join.members.push(user_id);
+                
+            }
+            // issue - we cant mutable borrow state twice, but I need to mutable borrow in order to use conn.writer
+            // okay, technically, we dont NEED to do this below bit. Perhaps if we wrap it in another function?
+            let message = format!("you have successfully joined {channel_name}!");
+
+            send_message_to_client(&state_clone_for_send_message, user_id, message).await?;
+            
+            // following this the client will receive a message saying like "you joined {channel name}"
+            // begs the question do i need to establish some kinda function for message a specific client (although in the future the client will likely also receive
+            // commands to display these as like a banner)
+        },
+        None => {
+            send_message_to_client(&state_clone_for_send_message, user_id, "Requested server not found.".to_string()).await?;
+        }
+    }
+    Ok(())
+}
+
+
+async fn match_channel_name_to_id(target_channel_name: String, state_clone: &Arc<Mutex<ServerState>>) -> Option<ChannelId>{
+    println!("attempting to join client to {}", &target_channel_name);
+    let mut target_channel_id: Option<ChannelId> = None;
+
+    let state = state_clone.lock().await;
+    
+
+    for(channel_id, channel) in state.channels.iter() {
+        if channel.name == target_channel_name {
+            target_channel_id = Some(*channel_id);
+            break;
+        }
+    }
+    target_channel_id
+}
+
+async fn send_message_to_client(state_clone:  &Arc<Mutex<ServerState>>, user_id: UserId, message: String) -> Result<(), AnyError>{
+    // lock state - find user connection based on user id - send them the message
+
+    let mut state = state_clone.lock().await;
+
+    if let Some(conn) = state.connections.get_mut(&user_id){
+        conn.writer.write_all(message.as_bytes()).await?;
+    }
+    Ok(())
 }
